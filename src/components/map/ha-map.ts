@@ -9,6 +9,7 @@ import type {
   Marker,
   MarkerClusterGroup,
   Polyline,
+  TileLayer,
 } from "leaflet";
 import type { PropertyValues } from "lit";
 import { css, ReactiveElement } from "lit";
@@ -24,7 +25,7 @@ import { setupLeafletMap } from "../../common/dom/setup-leaflet-map";
 import { computeStateDomain } from "../../common/entity/compute_state_domain";
 import { computeStateName } from "../../common/entity/compute_state_name";
 import { DecoratedMarker } from "../../common/map/decorated_marker";
-import { filterXSS } from "../../common/util/xss";
+import { filterAttributionXSS } from "../../common/util/xss";
 import type { HomeAssistant, ThemeMode } from "../../types";
 import { isTouch } from "../../util/is_touch";
 import "../ha-icon-button";
@@ -123,6 +124,13 @@ export class HaMap extends ReactiveElement {
 
   private _mapPaths: (Polyline | CircleMarker)[] = [];
 
+  private _baseLayer?: TileLayer;
+
+  // Overlay tile layers kept separate from `this.layers` (caller-supplied
+  // markers/paths/polygons) so theme-mode and marker churn don't disturb
+  // overlay z-order.
+  private _overlayLayers: TileLayer[] = [];
+
   private _clickCount = 0;
 
   private _isProgrammaticFit = false;
@@ -153,6 +161,10 @@ export class HaMap extends ReactiveElement {
       this._handleVisibilityChange
     );
     if (this.leafletMap) {
+      this._overlayLayers.forEach((l) => l.remove());
+      this._overlayLayers = [];
+      this._baseLayer?.remove();
+      this._baseLayer = undefined;
       this.leafletMap.remove();
       this.leafletMap = undefined;
       this.Leaflet = undefined;
@@ -242,6 +254,22 @@ export class HaMap extends ReactiveElement {
     map!.classList.toggle("forced-light", this.themeMode === "light");
   }
 
+  private _sanitizeAttrib<T extends { attribution?: string }>(opts: T): T {
+    if (opts.attribution) {
+      return { ...opts, attribution: filterAttributionXSS(opts.attribution) };
+    }
+    return opts;
+  }
+
+  private _sanitizedTileConfig() {
+    const raw = window.__HA_MAP_TILE_LAYER__;
+    if (!raw) return { base: undefined, overlays: undefined };
+    return {
+      base: this._sanitizeAttrib(raw.base),
+      overlays: raw.overlays?.map((o) => this._sanitizeAttrib(o)),
+    };
+  }
+
   private _loading = false;
 
   private async _loadMap(): Promise<void> {
@@ -254,11 +282,21 @@ export class HaMap extends ReactiveElement {
     }
     this._loading = true;
     try {
-      [this.leafletMap, this.Leaflet] = await setupLeafletMap(map, {
-        latitude: this.hass?.config.latitude ?? 52.3731339,
-        longitude: this.hass?.config.longitude ?? 4.8903147,
-        zoom: this.zoom,
-      });
+      const { base, overlays } = this._sanitizedTileConfig();
+      const handles = await setupLeafletMap(
+        map,
+        {
+          latitude: this.hass?.config.latitude ?? 52.3731339,
+          longitude: this.hass?.config.longitude ?? 4.8903147,
+          zoom: this.zoom,
+        },
+        base,
+        overlays
+      );
+      this.leafletMap = handles.map;
+      this.Leaflet = handles.Leaflet;
+      this._baseLayer = handles.baseLayer;
+      this._overlayLayers = handles.overlays;
       this._updateMapStyle();
       this.leafletMap.on("click", (ev) => {
         if (this._clickCount === 0) {
@@ -284,6 +322,11 @@ export class HaMap extends ReactiveElement {
         }
       });
       this._loaded = true;
+    } catch (err) {
+      // Surface map setup errors (e.g. invalid WMS config) to devtools so
+      // the user sees the misconfiguration instead of a silent blank map.
+      // eslint-disable-next-line no-console
+      console.error("ha-map: failed to load map", err);
     } finally {
       this._loading = false;
     }

@@ -124,6 +124,11 @@
         import("{{ extra_module }}");
         {%- endfor -%}
       </script>
+      {%- if map_tile_layer -%}
+      <script>
+        window.__HA_MAP_TILE_LAYER__ = {{ map_tile_layer | tojson }};
+      </script>
+      {%- endif -%}
     <% } %>
     <script>
         if (!window.latestJS) {
